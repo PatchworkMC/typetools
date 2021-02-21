@@ -17,6 +17,7 @@ package net.jodah.typetools;
 
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
 import java.lang.ref.Reference;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.AccessibleObject;
@@ -56,7 +57,9 @@ public final class TypeResolver {
   private static Object JAVA_LANG_ACCESS;
   private static Method GET_CONSTANT_POOL;
   private static Method GET_CONSTANT_POOL_SIZE;
-  private static Method GET_CONSTANT_POOL_METHOD_AT;
+  private static Method GET_CONSTANT_POOL_CLASS_AT;
+  private static Method GET_CONSTANT_POOL_METHOD_AT_IF_LOADED;
+  private static Method GET_CONSTANT_POOL_MEMBER_REF_INFO_AT;
   private static final Map<String, Method> OBJECT_METHODS = new HashMap<String, Method>();
   private static final Map<Class<?>, Class<?>> PRIMITIVE_WRAPPERS;
   private static final Double JAVA_VERSION;
@@ -126,12 +129,16 @@ public final class TypeResolver {
       String constantPoolName = JAVA_VERSION < 9 ? "sun.reflect.ConstantPool" : "jdk.internal.reflect.ConstantPool";
       Class<?> constantPoolClass = Class.forName(constantPoolName);
       GET_CONSTANT_POOL_SIZE = constantPoolClass.getDeclaredMethod("getSize");
-      GET_CONSTANT_POOL_METHOD_AT = constantPoolClass.getDeclaredMethod("getMethodAt", int.class);
+      GET_CONSTANT_POOL_CLASS_AT = constantPoolClass.getDeclaredMethod("getClassAt", int.class);
+      GET_CONSTANT_POOL_METHOD_AT_IF_LOADED = constantPoolClass.getDeclaredMethod("getMethodAtIfLoaded", int.class);
+      GET_CONSTANT_POOL_MEMBER_REF_INFO_AT = constantPoolClass.getDeclaredMethod("getMemberRefInfoAt", int.class);
 
       // setting the methods as accessible
       accessSetter.makeAccessible(GET_CONSTANT_POOL);
       accessSetter.makeAccessible(GET_CONSTANT_POOL_SIZE);
-      accessSetter.makeAccessible(GET_CONSTANT_POOL_METHOD_AT);
+      accessSetter.makeAccessible(GET_CONSTANT_POOL_CLASS_AT);
+      accessSetter.makeAccessible(GET_CONSTANT_POOL_METHOD_AT_IF_LOADED);
+      accessSetter.makeAccessible(GET_CONSTANT_POOL_MEMBER_REF_INFO_AT);
 
       // additional checks - make sure we get a result when invoking the Class::getConstantPool and
       // ConstantPool::getSize on a class
@@ -728,10 +735,42 @@ public final class TypeResolver {
 
     Member result = null;
     for (int i = getConstantPoolSize(constantPool) - 1; i >= 0; i--) {
-      Member member = getConstantPoolMethodAt(constantPool, i);
+      Member member;
+      try {
+        member = (Member) GET_CONSTANT_POOL_METHOD_AT_IF_LOADED.invoke(constantPool, i);
+      } catch (Exception ignore) {
+        continue;
+      }
+
+      // If method has not been loaded, use reference info to find method
+      if (member == null) {
+        String[] memberRefInfo = getConstantPoolMemberRefInfoAt(constantPool, i);
+        if (memberRefInfo == null || memberRefInfo.length != 3)
+          continue;
+        MethodType methodType = MethodType.fromMethodDescriptorString(memberRefInfo[2], type.getClassLoader());
+
+        Class<?> owner = null;
+        for (int j = i; j >= 0; j--) {
+          owner = getConstantPoolClassAt(constantPool, j);
+          if (owner != null && owner.getName().replace('.', '/').equals(memberRefInfo[0]))
+            break;
+        }
+
+        if (owner == null)
+          continue;
+
+        try {
+          if (memberRefInfo[1].equals("<init>"))
+            member = owner.getDeclaredConstructor(methodType.parameterArray());
+          else
+            member = owner.getDeclaredMethod(memberRefInfo[1], methodType.parameterArray());
+        } catch (Exception ignore) {
+          continue;
+        }
+      }
+
       // Skip SerializedLambda constructors and members of the "type" class
-      if (member == null
-          || (member instanceof Constructor
+      if ((member instanceof Constructor
               && member.getDeclaringClass().getName().equals("java.lang.invoke.SerializedLambda"))
           || member.getDeclaringClass().isAssignableFrom(type))
         continue;
@@ -764,9 +803,17 @@ public final class TypeResolver {
     }
   }
 
-  private static Member getConstantPoolMethodAt(Object constantPool, int i) {
+  private static Class<?> getConstantPoolClassAt(Object constantPool, int i) {
     try {
-      return (Member) GET_CONSTANT_POOL_METHOD_AT.invoke(constantPool, i);
+      return (Class<?>) GET_CONSTANT_POOL_CLASS_AT.invoke(constantPool, i);
+    } catch (Exception ignore) {
+      return null;
+    }
+  }
+
+  private static String[] getConstantPoolMemberRefInfoAt(Object constantPool, int i) {
+    try {
+      return (String[]) GET_CONSTANT_POOL_MEMBER_REF_INFO_AT.invoke(constantPool, i);
     } catch (Exception ignore) {
       return null;
     }
